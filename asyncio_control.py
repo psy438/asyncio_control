@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterable
-from typing import Callable, Any, Optional, Coroutine, List
+from typing import Callable, Any, Optional, Coroutine, List, Dict
+from inspect import iscoroutinefunction
 
 
 async def async_main(task: Callable, maxNum: int, doneNum: int, args: list):
@@ -35,7 +36,7 @@ class runFoeverByTime:
 
 
 class runFoeverUntilStop:
-    '''完成所有的任务之后立刻停止，(同步阻塞代码)'''
+    '''完成所有的任务(Task)之后立刻停止，(同步阻塞代码),类似call_soon这种则会直接失效'''
 
     def __init__(self, loop=asyncio.get_event_loop()):
         self.loop = loop
@@ -53,7 +54,9 @@ class runFoeverUntilStop:
             if self.length <= 0:
                 self.loop.stop()
         for task in self.tasks_list:
-            task.add_done_callback(callback)
+            if not task.done():
+                task.add_done_callback(callback)
+
         self.loop.run_forever()
 
 
@@ -141,7 +144,7 @@ class deepSearchSync:
                     que.append(node)
 
 
-class deepSearchASync:
+class deepSearchCallbackASync:
     '''tree接受树,branch接受属性,以字符串表示,val代表节点的值,branch属性值必须是一个可迭代对象,回调若是传入了同步函数,就会以同步的方式调用'''
 
     def __init__(self, tree, branch: str, val: str, callback: Optional[Callable] = None, loop=asyncio.get_event_loop()):
@@ -156,6 +159,7 @@ class deepSearchASync:
 
     def __get(self):
         # 默认是广搜
+        '''0是广度优先,1是深度优先'''
         que = [self.tree]
         while len(que) > 0:
             node = que.pop(0)
@@ -175,3 +179,88 @@ class deepSearchASync:
                     if type(node) != type(self.tree):
                         raise IndexError('the branch must instance branch')
                     que.append(node)
+
+
+def Taskall(tasks: List[asyncio.Task]):
+    '''相当于js中Promise.all的弱化版本'''
+    result = [None]*len(tasks)
+    taskDict: Dict[asyncio.Task, int] = {}
+
+    def callback(task: asyncio.Task):
+        result[taskDict[task]] = task.result()
+    for i, task in enumerate(tasks):
+        taskDict[task] = i
+        if not task.done():
+            task.add_done_callback(callback)
+        else:
+            result[i] = task.result()
+    return result
+
+
+class Promise:
+    def __init__(self, func: Callable[[Callable, Callable], None] = lambda resolve, reject: None, loop=asyncio.get_event_loop()):
+        self.hasDone = False
+        self.data = None
+        self.loop = loop
+        self.functions = []
+        # Queue[data,Literal['hasDone','hasErr']]
+        self.que = asyncio.Queue(maxsize=1)
+
+        def resolve(data):
+            self.hasDone = True
+            self.data = data
+            self.que.put_nowait([self.data, 'hasDone'])
+
+        def reject(err):
+            self.err = err
+        try:
+            func(resolve, reject)
+        except Exception as e:  # 传递错误
+            self.err = e
+        self.__hasUseRejected = False
+
+    def then(self, resolved: Callable, rejected: Callable = lambda err: err):
+        # 错误传递
+        if hasattr(self, 'err'):
+            if iscoroutinefunction(rejected):
+                raise IndexError(
+                    'the rejected function should be sync function!!!')
+            self.err = rejected(self.err)
+            return self
+        # 完成数据传递
+        getTask = self.loop.create_task(self.que.get())
+
+        def getCallback(t):
+            getTaskresult = t.result()
+            if getTaskresult[1] == 'hasDone':
+                thenTask = self.loop.create_task(
+                    self.__syncToAsync(resolved, [getTaskresult[0]]))
+            else:
+                thenTask = self.loop.create_task(
+                    self.__syncToAsync(rejected, [getTaskresult[0]]))
+
+            def thisCallback(ta: asyncio.Task):
+                thisException = ta.exception()
+                if thisException != None or self.__hasUseRejected:
+                    if not self.__hasUseRejected:
+                        errType: str = type(thisException).__name__
+                        errContent: str = str(thisException)
+                        self.err = errContent
+                    self.loop.create_task(
+                        self.que.put([self.err, 'hasErr']))
+                    self.__hasUseRejected = True
+                else:
+                    self.loop.create_task(
+                        self.que.put([ta.result(), 'hasDone']))
+            thenTask.add_done_callback(thisCallback)
+        getTask.add_done_callback(getCallback)
+        return self
+
+    def __syncToAsync(self, function: Callable, args: Iterable = []) -> Coroutine[Any, Any, Any]:
+        if iscoroutinefunction(function):
+            return function(*args)
+
+        else:
+            async def result() -> Any:
+                return function(*args)
+            return result()
